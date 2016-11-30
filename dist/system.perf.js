@@ -978,6 +978,92 @@ function logloads(loads) {
 
 var System;
 
+/*
+ * Traceur, Babel and TypeScript transpile hook for Loader
+ */
+var transpile = (function() {
+
+  // use Traceur by default
+  Loader.prototype.transpiler = 'traceur';
+
+  function transpile(load) {
+    var self = this;
+
+    return Promise.resolve(__global[self.transpiler == 'typescript' ? 'ts' : self.transpiler]
+        || (self.pluginLoader || self)['import'](self.transpiler))
+    .then(function(transpiler) {
+      if (transpiler.__useDefault)
+        transpiler = transpiler['default'];
+
+      var transpileFunction;
+      if (transpiler.Compiler)
+        transpileFunction = traceurTranspile;
+      else if (transpiler.createLanguageService)
+        transpileFunction = typescriptTranspile;
+      else
+        transpileFunction = babelTranspile;
+
+      // note __moduleName will be part of the transformer meta in future when we have the spec for this
+      return '(function(__moduleName){' + transpileFunction.call(self, load, transpiler) + '\n})("' + load.name + '");\n//# sourceURL=' + load.address + '!transpiled';
+    });
+  };
+
+  function traceurTranspile(load, traceur) {
+    var options = this.traceurOptions || {};
+    options.modules = 'instantiate';
+    options.script = false;
+    if (options.sourceMaps === undefined)
+      options.sourceMaps = 'inline';
+    options.filename = load.address;
+    options.inputSourceMap = load.metadata.sourceMap;
+    options.moduleName = false;
+
+    var compiler = new traceur.Compiler(options);
+
+    return doTraceurCompile(load.source, compiler, options.filename);
+  }
+  function doTraceurCompile(source, compiler, filename) {
+    try {
+      return compiler.compile(source, filename);
+    }
+    catch(e) {
+      // on older versions of traceur (<0.9.3), an array of errors is thrown
+      // rather than a single error.
+      if (e.length) {
+        throw e[0];
+      }
+      throw e;
+    }
+  }
+
+  function babelTranspile(load, babel) {
+    var options = this.babelOptions || {};
+    options.modules = 'system';
+    if (options.sourceMap === undefined)
+      options.sourceMap = 'inline';
+    options.inputSourceMap = load.metadata.sourceMap;
+    options.filename = load.address;
+    options.code = true;
+    options.ast = false;
+
+    return babel.transform(load.source, options).code;
+  }
+
+  function typescriptTranspile(load, ts) {
+    var options = this.typescriptOptions || {};
+    options.target = options.target || ts.ScriptTarget.ES5;
+    if (options.sourceMap === undefined)
+      options.sourceMap = true;
+    if (options.sourceMap && options.inlineSourceMap !== false)
+      options.inlineSourceMap = true;
+
+    options.module = ts.ModuleKind.System;
+
+    return ts.transpile(load.source, options, load.address);
+  }
+
+  return transpile;
+})();
 // SystemJS Loader Class and Extension helpers
 function SystemJSLoader() {
   Loader.call(this);
@@ -1255,131 +1341,374 @@ function createInstantiate (load, result) {
   load.metadata.entry.deps = [];
   load.metadata.format = 'defined';
 }
-  var fetchTextFromURL;
-  if (typeof XMLHttpRequest != 'undefined') {
-    fetchTextFromURL = function(url, authorization, fulfill, reject) {
-      var xhr = new XMLHttpRequest();
-      var sameDomain = true;
-      var doTimeout = false;
-      if (!('withCredentials' in xhr)) {
-        // check if same domain
-        var domainCheck = /^(\w+:)?\/\/([^\/]+)/.exec(url);
-        if (domainCheck) {
-          sameDomain = domainCheck[2] === window.location.host;
-          if (domainCheck[1])
-            sameDomain &= domainCheck[1] === window.location.protocol;
-        }
-      }
-      if (!sameDomain && typeof XDomainRequest != 'undefined') {
-        xhr = new XDomainRequest();
-        xhr.onload = load;
-        xhr.onerror = error;
-        xhr.ontimeout = error;
-        xhr.onprogress = function() {};
-        xhr.timeout = 0;
-        doTimeout = true;
-      }
-      function load() {
-        fulfill(xhr.responseText);
-      }
-      function error() {
-        reject(new Error('XHR error' + (xhr.status ? ' (' + xhr.status + (xhr.statusText ? ' ' + xhr.statusText  : '') + ')' : '') + ' loading ' + url));
-      }
+/*
+ * SystemJS performance measurement addon
+ *
+ */
+(function() {
+function perfEvent(eventName, eventItem) {
+  var evt = new ProfileEvent(eventName, eventItem);
+  events.push(evt);
+  return evt;
+};
 
-      xhr.onreadystatechange = function () {
-        if (xhr.readyState === 4) {
-          // in Chrome on file:/// URLs, status is 0
-          if (xhr.status == 0) {
-            if (xhr.responseText) {
-              load();
-            }
-            else {
-              // when responseText is empty, wait for load or error event
-              // to inform if it is a 404 or empty file
-              xhr.addEventListener('error', error);
-              xhr.addEventListener('load', load);
-            }
-          }
-          else if (xhr.status === 200) {
-            load();
-          }
-          else {
-            error();
-          }
-        }
-      };
-      xhr.open("GET", url, true);
+// we extend the hook function itself to create performance instrumentation per extension
+var curHook = hook;
 
-      if (xhr.setRequestHeader) {
-        xhr.setRequestHeader('Accept', 'application/x-es-module, */*');
-        // can set "authorization: true" to enable withCredentials only
-        if (authorization) {
-          if (typeof authorization == 'string')
-            xhr.setRequestHeader('Authorization', authorization);
-          xhr.withCredentials = true;
-        }
-      }
+var resolverHooks = ['import', 'normalizeSync', 'decanonicalize', 'normalize'];
+var pipelineHooks = ['locate', 'fetch', 'translate', 'instantiate'];
+hook = function(name, newHook) {
+  // hook information
+  var resolver = resolverHooks.indexOf(name) != -1;
+  var pipeline = pipelineHooks.indexOf(name) != -1;
+  var hookEvtName = name + ':' + newHook.toString().substr(0, 200);
 
-      if (doTimeout) {
-        setTimeout(function() {
-          xhr.send();
-        }, 0);
-      } else {
-        xhr.send(null);
-      }
-    };
-  }
-  else if (typeof require != 'undefined' && typeof process != 'undefined') {
-    var fs;
-    fetchTextFromURL = function(url, authorization, fulfill, reject) {
-      if (url.substr(0, 8) != 'file:///')
-        throw new Error('Unable to fetch "' + url + '". Only file URLs of the form file:/// allowed running in Node.');
-      fs = fs || require('fs');
-      if (isWindows)
-        url = url.replace(/\//g, '\\').substr(8);
-      else
-        url = url.substr(7);
-      return fs.readFile(url, function(err, data) {
-        if (err) {
-          return reject(err);
+  curHook(name, function(prevHook) {
+    return function() {
+      // this is called when the hook runs
+      var hookItem = resolver ? arguments[0] + ' : ' + arguments[1] + ' : ' + !!arguments[2] : arguments[0] && arguments[0].name;
+      var evt = perfEvent(hookEvtName, hookItem);
+
+      // ignore time spent in the old hook
+      var fn = newHook(function() {
+        evt.pause();
+        var output = prevHook.apply(this, arguments);
+
+        if (output && output.toString && output.toString() == '[object Promise]') {
+          return Promise.resolve(output)
+          .then(function(output) {
+            evt.resume();
+            return output;
+          })
+          .catch(function(err) {
+            evt.resume()
+            throw err;
+          });
         }
         else {
-          // Strip Byte Order Mark out if it's the leading char
-          var dataString = data + '';
-          if (dataString[0] === '\ufeff')
-            dataString = dataString.substr(1);
-
-          fulfill(dataString);
+          evt.resume();
+          return output;
         }
       });
-    };
-  }
-  else if (typeof self != 'undefined' && typeof self.fetch != 'undefined') {
-    fetchTextFromURL = function(url, authorization, fulfill, reject) {
-      var opts = {
-        headers: {'Accept': 'application/x-es-module, */*'}
-      };
 
-      if (authorization) {
-        if (typeof authorization == 'string')
-          opts.headers['Authorization'] = authorization;
-        opts.credentials = 'include';
+      var output;
+      try {
+        output = fn.apply(this, arguments);
+      }
+      catch(e) {
+        evt.cancel();
+        throw e;
       }
 
-      fetch(url, opts)
-        .then(function (r) {
-          if (r.ok) {
-            return r.text();
-          } else {
-            throw new Error('Fetch error: ' + r.status + ' ' + r.statusText);
-          }
+      if (output && output.toString && output.toString() == '[object Promise]') {
+        return Promise.resolve(output)
+        .then(function(output) {
+          evt.done();
+          return output;
         })
-        .then(fulfill, reject);
+        .catch(function(err) {
+          evt.cancel();
+          throw err;
+        });
+      }
+      else {
+        evt.done();
+        return output;
+      }
+    };
+  });
+};
+
+// profiling events
+var events = [];
+
+var perf = typeof performance != 'undefined' : performance : Date;
+
+// Performance Event class
+function ProfileEvent(name, item) {
+  this.name = name;
+  this.item = (typeof item == 'function' ? item() : item) || 'default';
+  this.start = perf.now();
+  this.stop = null;
+  this.pauseTime = null;
+  this.cancelled = false;
+}
+ProfileEvent.prototype.rename = function(name, item) {
+  this.name = name;
+  if (arguments.length > 1)
+    this.item = item;
+};
+ProfileEvent.prototype.done = function() {
+  if (this.stop)
+    throw new TypeError('Event ' + this.name + ' (' + this.item + ') has already completed.');
+  this.stop = perf.now();
+};
+ProfileEvent.prototype.cancel = function() {
+  this.cancelled = true;
+};
+ProfileEvent.prototype.cancelIfNotDone = function() {
+  if (!this.stop)
+    this.cancelled = true;
+};
+ProfileEvent.prototype.pause = function() {
+  if (this.stop)
+    throw new TypeError('Event ' + this.name + ' (' + this.item + ') cannot be paused as it has finished.');
+  if (!this.pauseTime)
+    this.pauseTime = perf.now();
+};
+ProfileEvent.prototype.resume = function() {
+  if (!this.pauseTime)
+    throw new TypeError('Event ' + this.name + ' (' + this.item + ') is not already paused.');
+  this.start += perf.now() - this.pauseTime;
+  this.pauseTime = null;
+};
+
+var logged = false;
+SystemJSLoader.prototype.perfSummary = function(includeEvts) {
+  logged = true;
+  // create groupings of events by event name to time data
+  // filtering out cancelled events
+  var groupedEvents = {};
+  events.forEach(function(evt) {
+    if (includeEvts && !includeEvts(evt))
+      return;
+    if (evt.cancelled)
+      return;
+    if (!evt.stop) {
+      console.warn('Event ' + evt.name + ' (' + evt.item + ') never completed.');
+      return;
     }
+
+    var evtTimes = groupedEvents[evt.name] = groupedEvents[evt.name] || [];
+    evtTimes.push({
+      time: evt.stop - evt.start,
+      item: evt.item
+    });
+  });
+
+  Object.keys(groupedEvents).forEach(function(evt) {
+    var evtTimes = groupedEvents[evt];
+
+    // only one event -> log as a single event
+    if (evtTimes.length == 1) {
+      console.log(toTitleCase(evt) + (evtTimes[0].item != 'default' ? ' (' + evtTimes[0].item + ')' : ''));
+      logStat('Total Time', evtTimes[0].time);
+      console.log('');
+      return;
+    }
+
+    // multiple events, give some stats!
+    var evtCount = evtTimes.length;
+
+    console.log(toTitleCase(evt) + ' (' + evtCount + ' events)');
+
+    var totalTime = evtTimes.reduce(function(curSum, evt) {
+      return curSum + evt.time;
+    }, 0);
+    logStat('Cumulative Time', totalTime);
+
+    var mean = totalTime / evtCount;
+    logStat('Mean', mean);
+
+    var stdDev = Math.sqrt(evtTimes.reduce(function(curSum, evt) {
+      return curSum + Math.pow(evt.time - mean, 2);
+    }, 0) / evtCount);
+
+    logStat('Std Deviation', stdDev);
+
+    var withoutOutliers = evtTimes.filter(function(evt) {
+      return evt.time > mean - stdDev && evt.time < mean + stdDev;
+    });
+
+    logStat('Avg within 2σ', withoutOutliers.reduce(function(curSum, evt) {
+      return curSum + evt.time;
+    }, 0) / withoutOutliers.length);
+
+    var sorted = evtTimes.sort(function(a, b) {
+      return a.time > b.time ? 1 : -1;
+    });
+
+    var medianIndex = Math.round(evtCount / 2);
+    logStat('Median', sorted[medianIndex].time, sorted[medianIndex].evt);
+
+    logStat('Max', sorted[evtCount - 1].time, sorted[evtCount - 1].item);
+
+    logStat('Min', sorted[0].time, sorted[0].item);
+
+    var duplicates = evtTimes.filter(function(evt) {
+      return evtTimes.some(function(dup) {
+        return dup !== evt && dup.name == evt.name && dup.item == evt.item;
+      });
+    });
+
+    logStat('Duplicate Events', duplicates.length, true);
+
+    logStat('Total Duplicated Time', duplicates.reduce(function(duplicateTime, evt) {
+      return duplicateTime + evt.time;
+    }, 0));
+
+    console.log('');
+  });
+};
+
+function toTitleCase(title) {
+  return title.split('-').map(function(part) {
+    return part[0].toUpperCase() + part.substr(1);
+  }).join(' ');
+}
+
+var titleLen = 25;
+function logStat(title, value, item, isNum) {
+  if (item === true) {
+    item = undefined;
+    isNum = true;
   }
-  else {
-    throw new TypeError('No environment fetch API available.');
+  var spaces = Array(titleLen - title.length + 1).join(' ');
+  var value = isNum ? value : Math.round(value * 100) / 100 + 'ms';
+  console.log('  ' + title + spaces + ': ' + value + (item ? ' (' + item + ')' : ''));
+}
+})();// we define a __exec for globally-scoped execution
+// used by module format implementations
+var __exec;
+
+(function() {
+
+  var hasBuffer = typeof Buffer != 'undefined';
+  try {
+    if (hasBuffer && new Buffer('a').toString('base64') != 'YQ==')
+      hasBuffer = false;
   }
+  catch(e) {
+    hasBuffer = false;
+  }
+
+  var sourceMapPrefix = '\n//# sourceMappingURL=data:application/json;base64,';
+  function inlineSourceMap(sourceMapString) {
+    if (hasBuffer)
+      return sourceMapPrefix + new Buffer(sourceMapString).toString('base64');
+    else if (typeof btoa != 'undefined')
+      return sourceMapPrefix + btoa(unescape(encodeURIComponent(sourceMapString)));
+    else
+      return '';
+  }
+
+  function getSource(load, wrap) {
+    var lastLineIndex = load.source.lastIndexOf('\n');
+
+    // wrap ES formats with a System closure for System global encapsulation
+    if (load.metadata.format == 'global')
+      wrap = false;
+
+    var sourceMap = load.metadata.sourceMap;
+    if (sourceMap) {
+      if (typeof sourceMap != 'object')
+        throw new TypeError('load.metadata.sourceMap must be set to an object.');
+
+      sourceMap = JSON.stringify(sourceMap);
+    }
+
+    return (wrap ? '(function(System, SystemJS) {' : '') + load.source + (wrap ? '\n})(System, System);' : '')
+        // adds the sourceURL comment if not already present
+        + (load.source.substr(lastLineIndex, 15) != '\n//# sourceURL='
+          ? '\n//# sourceURL=' + load.address + (sourceMap ? '!transpiled' : '') : '')
+        // add sourceMappingURL if load.metadata.sourceMap is set
+        + (sourceMap && inlineSourceMap(sourceMap) || '');
+  }
+
+  var curLoad;
+
+  // System.register, System.registerDynamic, AMD define pipeline
+  // if currently evalling code here, immediately reduce the registered entry against the load record
+  hook('pushRegister_', function() {
+    return function(register) {
+      if (!curLoad)
+        return false;
+
+      this.reduceRegister_(curLoad, register);
+      return true;
+    };
+  });
+
+  // System clobbering protection (mostly for Traceur)
+  var curSystem;
+  var callCounter = 0;
+  function preExec(loader, load) {
+    curLoad = load;
+    if (callCounter++ == 0)
+      curSystem = __global.System;
+    __global.System = __global.SystemJS = loader;
+  }
+  function postExec() {
+    if (--callCounter == 0)
+      __global.System = __global.SystemJS = curSystem;
+    curLoad = undefined;
+  }
+
+  var useVm;
+  var vm;
+  __exec = function(load) {
+    if (!load.source)
+      return;
+    if ((load.metadata.integrity || load.metadata.nonce) && supportsScriptExec)
+      return scriptExec.call(this, load);
+    try {
+      preExec(this, load);
+      curLoad = load;
+      // global scoped eval for node (avoids require scope leak)
+      if (!vm && this._nodeRequire) {
+        vm = this._nodeRequire('vm');
+        useVm = vm.runInThisContext("typeof System !== 'undefined' && System") === this;
+      }
+      if (useVm)
+        vm.runInThisContext(getSource(load, true), { filename: load.address + (load.metadata.sourceMap ? '!transpiled' : '') });
+      else
+        (0, eval)(getSource(load, true));
+      postExec();
+    }
+    catch(e) {
+      postExec();
+      throw addToError(e, 'Evaluating ' + load.address);
+    }
+  };
+
+  var supportsScriptExec = false;
+  if (isBrowser && typeof document != 'undefined' && document.getElementsByTagName) {
+    if (!(window.chrome && window.chrome.extension || navigator.userAgent.match(/^Node\.js/)))
+      supportsScriptExec = true;
+  }
+
+  // script execution via injecting a script tag into the page
+  // this allows CSP integrity and nonce to be set for CSP environments
+  var head;
+  function scriptExec(load) {
+    if (!head)
+      head = document.head || document.body || document.documentElement;
+
+    var script = document.createElement('script');
+    script.text = getSource(load, false);
+    var onerror = window.onerror;
+    var e;
+    window.onerror = function(_e) {
+      e = addToError(_e, 'Evaluating ' + load.address);
+      if (onerror)
+        onerror.apply(this, arguments);
+    }
+    preExec(this, load);
+
+    if (load.metadata.integrity)
+      script.setAttribute('integrity', load.metadata.integrity);
+    if (load.metadata.nonce)
+      script.setAttribute('nonce', load.metadata.nonce);
+
+    head.appendChild(script);
+    head.removeChild(script);
+    postExec();
+    window.onerror = onerror;
+    if (e)
+      throw e;
+  }
+
+})();
 function readMemberExpression(p, value) {
   var pParts = p.split('.');
   while (pParts.length)
@@ -3304,6 +3633,246 @@ function createEntry() {
     };
   });
 })();
+/*
+ * Extension to detect ES6 and auto-load Traceur or Babel for processing
+ */
+(function() {
+  // good enough ES6 module detection regex - format detections not designed to be accurate, but to handle the 99% use case
+  var esmRegEx = /(^\s*|[}\);\n]\s*)(import\s*(['"]|(\*\s+as\s+)?[^"'\(\)\n;]+\s*from\s*['"]|\{)|export\s+\*\s+from\s+["']|export\s*(\{|default|function|class|var|const|let|async\s+function))/;
+
+  var traceurRuntimeRegEx = /\$traceurRuntime\s*\./;
+  var babelHelpersRegEx = /babelHelpers\s*\./;
+
+  hook('translate', function(translate) {
+    return function(load) {
+      var loader = this;
+      var args = arguments;
+      return translate.apply(loader, args)
+      .then(function(source) {
+        // detect & transpile ES6
+        if (load.metadata.format == 'esm' || load.metadata.format == 'es6' || !load.metadata.format && source.match(esmRegEx)) {
+          if (load.metadata.format == 'es6')
+            warn.call(loader, 'Module ' + load.name + ' has metadata setting its format to "es6", which is deprecated.\nThis should be updated to "esm".');
+
+          load.metadata.format = 'esm';
+
+          if (load.metadata.deps) {
+            var depInject = '';
+            for (var i = 0; i < load.metadata.deps.length; i++)
+              depInject += 'import "' + load.metadata.deps[i] + '"; ';
+            load.source = depInject + source;
+          }
+
+          if (loader.transpiler === false) {
+            // we accept translation to esm for builds though to enable eg rollup optimizations
+            if (loader.builder)
+              return source;
+            throw new TypeError('Unable to dynamically transpile ES module as SystemJS.transpiler set to false.');
+          }
+
+          // setting _loader.loadedTranspiler = false tells the next block to
+          // do checks for setting transpiler metadata
+          loader._loader.loadedTranspiler = loader._loader.loadedTranspiler || false;
+          if (loader.pluginLoader)
+            loader.pluginLoader._loader.loadedTranspiler = loader._loader.loadedTranspiler || false;
+
+          // do transpilation
+          return (loader._loader.transpilerPromise || (
+            loader._loader.transpilerPromise = Promise.resolve(
+              __global[loader.transpiler == 'typescript' ? 'ts' : loader.transpiler] || (loader.pluginLoader || loader).normalize(loader.transpiler)
+              .then(function(normalized) {
+                loader._loader.transpilerNormalized = normalized;
+                return (loader.pluginLoader || loader).load(normalized)
+                .then(function() {
+                  return (loader.pluginLoader || loader).get(normalized);
+                });
+              })
+          ))).then(function(transpiler) {
+            loader._loader.loadedTranspilerRuntime = true;
+
+            if (typeof transpiler.default === 'function' && !__global[loader.transpiler == 'typescript' ? 'ts' : loader.transpiler]) {
+              // instantiate plugins dont build
+              if (loader.builder)
+                return source;
+              return Promise.resolve(transpiler.default.call(loader, load.address, load.name))
+              .then(function (result) {
+                createInstantiate(load, result);
+                return '';
+              });
+            }
+
+            // translate hooks means this is a transpiler plugin instead of a raw implementation
+            if (transpiler.translate) {
+              // if transpiler is the same as the plugin loader, then don't run twice
+              if (transpiler == load.metadata.loaderModule)
+                return load.source;
+
+              // convert the source map into an object for transpilation chaining
+              if (typeof load.metadata.sourceMap == 'string')
+                load.metadata.sourceMap = JSON.parse(load.metadata.sourceMap);
+
+              return Promise.resolve(transpiler.translate.apply(loader, args))
+              .then(function(source) {
+                // sanitize sourceMap if an object not a JSON string
+                var sourceMap = load.metadata.sourceMap;
+                if (sourceMap && typeof sourceMap == 'object') {
+                  var originalName = load.address.split('!')[0];
+
+                  // force set the filename of the original file
+                  if (!sourceMap.file || sourceMap.file == load.address)
+                    sourceMap.file = originalName + '!transpiled';
+
+                  // force set the sources list if only one source
+                  if (!sourceMap.sources || sourceMap.sources.length <= 1 && (!sourceMap.sources[0] || sourceMap.sources[0] == load.address))
+                    sourceMap.sources = [originalName];
+                }
+
+                if (load.metadata.format == 'esm' && !loader.builder && detectRegisterFormat(source))
+                  load.metadata.format = 'register';
+                return source;
+              });
+            }
+
+            // legacy builder support
+            if (loader.builder)
+              load.metadata.originalSource = load.source;
+
+            // defined in es6-module-loader/src/transpile.js
+            return transpile.call(loader, load)
+            .then(function(source) {
+              // clear sourceMap as transpiler embeds it
+              load.metadata.sourceMap = undefined;
+              return source;
+            });
+          }, function(err) {
+            throw addToError(err, 'Unable to load transpiler to transpile ' + load.name);
+          });
+        }
+
+        // skip transpiler and transpiler runtime loading when transpiler is disabled
+        if (loader.transpiler === false)
+          return source;
+
+        // load the transpiler correctly
+        if (loader._loader.loadedTranspiler === false && (loader.transpiler == 'traceur' || loader.transpiler == 'typescript' || loader.transpiler == 'babel')
+            && load.name == loader.normalizeSync(loader.transpiler)) {
+
+          // always load transpiler as a global
+          if (source.length > 100 && !load.metadata.format) {
+            load.metadata.format = 'global';
+
+            if (loader.transpiler === 'traceur')
+              load.metadata.exports = 'traceur';
+            if (loader.transpiler === 'typescript')
+              load.metadata.exports = 'ts';
+          }
+
+          loader._loader.loadedTranspiler = true;
+        }
+
+        // load the transpiler runtime correctly
+        if (loader._loader.loadedTranspilerRuntime === false) {
+          if (load.name == loader.normalizeSync('traceur-runtime')
+              || load.name == loader.normalizeSync('babel/external-helpers*')) {
+            if (source.length > 100)
+              load.metadata.format = load.metadata.format || 'global';
+
+            loader._loader.loadedTranspilerRuntime = true;
+          }
+        }
+
+        // detect transpiler runtime usage to load runtimes
+        if ((load.metadata.format == 'register' || load.metadata.bundle) && loader._loader.loadedTranspilerRuntime !== true) {
+          if (loader.transpiler == 'traceur' && !__global.$traceurRuntime && load.source.match(traceurRuntimeRegEx)) {
+            loader._loader.loadedTranspilerRuntime = loader._loader.loadedTranspilerRuntime || false;
+            return loader['import']('traceur-runtime').then(function() {
+              return source;
+            });
+          }
+          if (loader.transpiler == 'babel' && !__global.babelHelpers && load.source.match(babelHelpersRegEx)) {
+            loader._loader.loadedTranspilerRuntime = loader._loader.loadedTranspilerRuntime || false;
+            return loader['import']('babel/external-helpers').then(function() {
+              return source;
+            });
+          }
+        }
+
+        return source;
+      });
+    };
+  });
+
+})();
+/*
+  SystemJS Global Format
+
+  Supports
+    metadata.deps
+    metadata.globals
+    metadata.exports
+
+  Without metadata.exports, detects writes to the global object.
+*/
+var __globalName = typeof self != 'undefined' ? 'self' : 'global';
+
+hook('fetch', function(fetch) {
+  return function(load) {
+    if (load.metadata.exports && !load.metadata.format)
+      load.metadata.format = 'global';
+    return fetch.call(this, load);
+  };
+});
+
+// ideally we could support script loading for globals, but the issue with that is that
+// we can't do it with AMD support side-by-side since AMD support means defining the
+// global define, and global support means not definining it, yet we don't have any hook
+// into the "pre-execution" phase of a script tag being loaded to handle both cases
+hook('instantiate', function(instantiate) {
+  return function(load) {
+    var loader = this;
+
+    if (!load.metadata.format)
+      load.metadata.format = 'global';
+
+    // global is a fallback module format
+    if (load.metadata.format == 'global' && !load.metadata.entry) {
+
+      var entry = createEntry();
+
+      load.metadata.entry = entry;
+
+      entry.deps = [];
+
+      for (var g in load.metadata.globals) {
+        var gl = load.metadata.globals[g];
+        if (gl)
+          entry.deps.push(gl);
+      }
+
+      entry.execute = function(require, exports, module) {
+
+        var globals;
+        if (load.metadata.globals) {
+          globals = {};
+          for (var g in load.metadata.globals)
+            if (load.metadata.globals[g])
+              globals[g] = require(load.metadata.globals[g]);
+        }
+        
+        var exportName = load.metadata.exports;
+
+        if (exportName)
+          load.source += '\n' + __globalName + '["' + exportName + '"] = ' + exportName + ';';
+
+        var retrieveGlobal = loader.get('@@global-helpers').prepareGlobal(module.id, exportName, globals, !!load.metadata.encapsulateGlobal);
+        __exec.call(loader, load);
+
+        return retrieveGlobal();
+      }
+    }
+    return instantiate.call(this, load);
+  };
+});
 
 
 function getGlobalValue(exports) {
@@ -3451,6 +4020,144 @@ hookConstructor(function(constructor) {
     }));
   };
 });
+/*
+  SystemJS CommonJS Format
+*/
+(function() {
+  // CJS Module Format
+  // require('...') || exports[''] = ... || exports.asd = ... || module.exports = ...
+  var cjsExportsRegEx = /(?:^\uFEFF?|[^$_a-zA-Z\xA0-\uFFFF.])(exports\s*(\[['"]|\.)|module(\.exports|\['exports'\]|\["exports"\])\s*(\[['"]|[=,\.]))/;
+  // RegEx adjusted from https://github.com/jbrantly/yabble/blob/master/lib/yabble.js#L339
+  var cjsRequireRegEx = /(?:^\uFEFF?|[^$_a-zA-Z\xA0-\uFFFF."'])require\s*\(\s*("[^"\\]*(?:\\.[^"\\]*)*"|'[^'\\]*(?:\\.[^'\\]*)*')\s*\)/g;
+  var commentRegEx = /(^|[^\\])(\/\*([\s\S]*?)\*\/|([^:]|^)\/\/(.*)$)/mg;
+
+  var stringRegEx = /("[^"\\\n\r]*(\\.[^"\\\n\r]*)*"|'[^'\\\n\r]*(\\.[^'\\\n\r]*)*')/g;
+
+  // used to support leading #!/usr/bin/env in scripts as supported in Node
+  var hashBangRegEx = /^\#\!.*/;
+
+  function getCJSDeps(source) {
+    cjsRequireRegEx.lastIndex = commentRegEx.lastIndex = stringRegEx.lastIndex = 0;
+
+    var deps = [];
+
+    var match;
+
+    // track string and comment locations for unminified source    
+    var stringLocations = [], commentLocations = [];
+
+    function inLocation(locations, match) {
+      for (var i = 0; i < locations.length; i++)
+        if (locations[i][0] < match.index && locations[i][1] > match.index)
+          return true;
+      return false;
+    }
+
+    if (source.length / source.split('\n').length < 200) {
+      while (match = stringRegEx.exec(source))
+        stringLocations.push([match.index, match.index + match[0].length]);
+
+      // TODO: track template literals here before comments
+      
+      while (match = commentRegEx.exec(source)) {
+        // only track comments not starting in strings
+        if (!inLocation(stringLocations, match))
+          commentLocations.push([match.index + match[1].length, match.index + match[0].length - 1]);
+      }
+    }
+
+    while (match = cjsRequireRegEx.exec(source)) {
+      // ensure we're not within a string or comment location
+      if (!inLocation(stringLocations, match) && !inLocation(commentLocations, match)) {
+        var dep = match[1].substr(1, match[1].length - 2);
+        // skip cases like require('" + file + "')
+        if (dep.match(/"|'/))
+          continue;
+        // trailing slash requires are removed as they don't map mains in SystemJS
+        if (dep[dep.length - 1] == '/')
+          dep = dep.substr(0, dep.length - 1);
+        deps.push(dep);
+      }
+    }
+
+    return deps;
+  }
+
+  hook('instantiate', function(instantiate) {
+    return function(load) {
+      var loader = this;
+      if (!load.metadata.format) {
+        cjsExportsRegEx.lastIndex = 0;
+        cjsRequireRegEx.lastIndex = 0;
+        if (cjsRequireRegEx.exec(load.source) || cjsExportsRegEx.exec(load.source))
+          load.metadata.format = 'cjs';
+      }
+
+      if (load.metadata.format == 'cjs') {
+        var metaDeps = load.metadata.deps;
+        var deps = load.metadata.cjsRequireDetection === false ? [] : getCJSDeps(load.source);
+
+        for (var g in load.metadata.globals)
+          if (load.metadata.globals[g])
+            deps.push(load.metadata.globals[g]);
+
+        var entry = createEntry();
+
+        load.metadata.entry = entry;
+
+        entry.deps = deps;
+        entry.executingRequire = true;
+        entry.execute = function(_require, exports, module) {
+          function require(name) {
+            if (name[name.length - 1] == '/')
+              name = name.substr(0, name.length - 1);
+            return _require.apply(this, arguments);
+          }
+          require.resolve = function(name) {
+            return loader.get('@@cjs-helpers').requireResolve(name, module.id);
+          };
+          // support module.paths ish
+          module.paths = [];
+          module.require = _require;
+
+          // ensure meta deps execute first
+          if (!load.metadata.cjsDeferDepsExecute)
+            for (var i = 0; i < metaDeps.length; i++)
+              require(metaDeps[i]);
+
+          var pathVars = loader.get('@@cjs-helpers').getPathVars(module.id);
+          var __cjsWrapper = {
+            exports: exports,
+            args: [require, exports, module, pathVars.filename, pathVars.dirname, __global, __global]
+          };
+
+          var cjsWrapper = "(function(require, exports, module, __filename, __dirname, global, GLOBAL";
+
+          // add metadata.globals to the wrapper arguments
+          if (load.metadata.globals)
+            for (var g in load.metadata.globals) {
+              __cjsWrapper.args.push(require(load.metadata.globals[g]));
+              cjsWrapper += ", " + g;
+            }
+
+          // disable AMD detection
+          var define = __global.define;
+          __global.define = undefined;
+          __global.__cjsWrapper = __cjsWrapper;
+
+          load.source = cjsWrapper + ") {" + load.source.replace(hashBangRegEx, '') + "\n}).apply(__cjsWrapper.exports, __cjsWrapper.args);";
+
+          __exec.call(loader, load);
+
+          __global.__cjsWrapper = undefined;
+          __global.define = define;
+        };
+      }
+
+      return instantiate.call(loader, load);
+    };
+  });
+})();
 hookConstructor(function(constructor) {
   return function() {
     var loader = this;
@@ -3738,6 +4445,48 @@ hookConstructor(function(constructor) {
     loader.amdRequire = require;
   };
 });/*
+  SystemJS AMD Format
+*/
+(function() {
+  // AMD Module Format Detection RegEx
+  // define([.., .., ..], ...)
+  // define(varName); || define(function(require, exports) {}); || define({})
+  var amdRegEx = /(?:^\uFEFF?|[^$_a-zA-Z\xA0-\uFFFF.])define\s*\(\s*("[^"]+"\s*,\s*|'[^']+'\s*,\s*)?\s*(\[(\s*(("[^"]+"|'[^']+')\s*,|\/\/.*\r?\n|\/\*(.|\s)*?\*\/))*(\s*("[^"]+"|'[^']+')\s*,?)?(\s*(\/\/.*\r?\n|\/\*(.|\s)*?\*\/))*\s*\]|function\s*|{|[_$a-zA-Z\xA0-\uFFFF][_$a-zA-Z0-9\xA0-\uFFFF]*\))/;
+
+  hook('instantiate', function(instantiate) {
+    return function(load) {
+      var loader = this;
+      
+      if (load.metadata.format == 'amd' || !load.metadata.format && load.source.match(amdRegEx)) {
+        load.metadata.format = 'amd';
+        
+        if (!loader.builder && loader.execute !== false) {
+          var curDefine = __global.define;
+          __global.define = this.amdDefine;
+
+          try {
+            __exec.call(loader, load);
+          }
+          finally {
+            __global.define = curDefine;
+          }
+
+          if (!load.metadata.entry && !load.metadata.bundle)
+            throw new TypeError('AMD module ' + load.name + ' did not define');
+        }
+        else {
+          load.metadata.execute = function() {
+            return load.metadata.builderExecute.apply(this, arguments);
+          };
+        }
+      }
+
+      return instantiate.call(loader, load);
+    };
+  });
+
+})();
+/*
   SystemJS Loader Plugin Support
 
   Supports plugin loader syntax with "!", or via metadata.loader
@@ -4471,26 +5220,10 @@ hookConstructor(function(constructor) {
   });
 })();
   
-/*
- * Script-only addition used for production loader
- *
- */
-hookConstructor(function(constructor) {
-  return function() {
-    constructor.apply(this, arguments);
-    __global.define = this.amdDefine;
-  };
-});
-
-hook('fetch', function(fetch) {
-  return function(load) {
-    load.metadata.scriptLoad = true;
-    return fetch.call(this, load);
-  };
-});System = new SystemJSLoader();
+System = new SystemJSLoader();
 
 __global.SystemJS = System;
-System.version = '0.19.41 CSP';
+System.version = '0.19.41 Standard';
   if (typeof module == 'object' && module.exports && typeof exports == 'object')
     module.exports = System;
 
